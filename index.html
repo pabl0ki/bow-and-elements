@@ -1,12 +1,29 @@
+<!DOCTYPE html>
 <html>
     <head>
-        <title>My Game</title>
+        <title>Bow and Elementals</title>
         <meta charset="UTF-8">
+        <style>
+            html, body {
+                margin: 0;
+                height: 100%;
+                background: #000;
+                overflow: hidden;
+            }
+            body {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            /* Холст масштабируется под окно с сохранением пропорций */
+            #canvas {
+                width: min(100vw, calc(100vh * 1900 / 1050));
+                height: auto;
+            }
+        </style>
     </head>
     <body>
-        <div id="image-container"></div>
         <canvas id="canvas"></canvas>
         <script src="script.js"></script>
-        
     </body>
 </html>
