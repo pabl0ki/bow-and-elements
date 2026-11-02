@@ -40,33 +40,81 @@ function saveXP(value) {
 }
 var totalXP = loadXP();
 
+// ===================== Улучшения (покупаются за опыт в меню) =====================
+const UPGRADES = [
+    { id: 'health',   key: '1', name: 'Здоровье',        desc: '+20 к макс. хп',      maxLevel: 5, baseCost: 40 },
+    { id: 'damage',   key: '2', name: 'Урон',            desc: '+10 к урону стрел',   maxLevel: 5, baseCost: 50 },
+    { id: 'fireRate', key: '3', name: 'Скорострельность', desc: '-8% к перезарядке',   maxLevel: 5, baseCost: 50 },
+    { id: 'speed',    key: '4', name: 'Скорость',        desc: '+8% к скорости бега', maxLevel: 5, baseCost: 30 }
+];
+
+function loadUpgrades() {
+    const levels = { health: 0, damage: 0, fireRate: 0, speed: 0 };
+    try {
+        const saved = JSON.parse(localStorage.getItem('bae_upgrades') || '{}');
+        for (const u of UPGRADES) levels[u.id] = Math.min(u.maxLevel, Math.max(0, Number(saved[u.id]) || 0));
+    } catch (e) { }
+    return levels;
+}
+function saveUpgrades() {
+    try { localStorage.setItem('bae_upgrades', JSON.stringify(upgradeLevels)); } catch (e) { }
+}
+var upgradeLevels = loadUpgrades();
+var shopMessage = '';
+var shopMessageTimer = 0;
+
+function upgradeCost(u) {
+    return u.baseCost * (upgradeLevels[u.id] + 1);
+}
+
+function buyUpgrade(index) {
+    const u = UPGRADES[index];
+    if (!u) return;
+    if (upgradeLevels[u.id] >= u.maxLevel) {
+        shopMessage = u.name + ': уже максимум';
+    } else if (totalXP < upgradeCost(u)) {
+        shopMessage = 'Не хватает опыта на «' + u.name + '»';
+    } else {
+        totalXP -= upgradeCost(u);
+        upgradeLevels[u.id]++;
+        saveXP(totalXP);
+        saveUpgrades();
+        shopMessage = '«' + u.name + '» — теперь ур. ' + upgradeLevels[u.id];
+    }
+    shopMessageTimer = 2;
+}
+
 // ===================== Состояние игры =====================
 // screen: 'menu' | 'playing' | 'gameover' | 'win'
 var screen = 'menu';
 var gameState;
 
 function newGame() {
+    const maxHealth = 120 + 20 * upgradeLevels.health;
     gameState = {
         player: {
             x: GAME.width / 2 - 60,
             y: GAME.height / 2 - 90,
             width: 120,
             height: 180,
-            speed: 300,          // пикселей в секунду
-            health: 120,
-            maxHealth: 120,
-            damage: 50,
-            bulletSpeed: 900,    // пикселей в секунду
-            fireRate: 0.5,       // секунд между выстрелами
-            invulnerableTime: 0  // секунд
+            speed: 300 * (1 + 0.08 * upgradeLevels.speed),        // пикселей в секунду
+            health: maxHealth,
+            maxHealth: maxHealth,
+            damage: 50 + 10 * upgradeLevels.damage,
+            bulletSpeed: 900,                                      // пикселей в секунду
+            fireRate: 0.5 * Math.pow(0.92, upgradeLevels.fireRate), // секунд между выстрелами
+            invulnerableTime: 0                                    // секунд
         },
         bullets: [],
         enemies: [],
+        pickups: [],
         time: 0,
         spawnTimer: 0,
         shotTimer: 0,
+        pickupTimer: 5,
         kills: 0,
-        xp: 0
+        xp: 0,
+        popups: []   // всплывающие надписи ("+30 HP" и т.п.)
     };
 }
 newGame();
@@ -87,10 +135,32 @@ function setKey(event, value) {
 
 window.addEventListener('keydown', (event) => {
     if (setKey(event, true)) event.preventDefault(); // стрелки не прокручивают страницу
-    if ((event.code === 'Enter' || event.code === 'Space') && screen !== 'playing') {
+    if (screen === 'playing') return;
+    if (event.code === 'Enter' || event.code === 'Space') {
         event.preventDefault();
         newGame();
         screen = 'playing';
+    } else if (screen === 'menu' && /^(Digit|Numpad)[1-4]$/.test(event.code)) {
+        buyUpgrade(Number(event.code.slice(-1)) - 1);
+    } else if (screen !== 'menu' && (event.code === 'Escape' || event.code === 'KeyM')) {
+        screen = 'menu';
+    }
+});
+
+// Клик мышью по карточкам магазина в меню
+function shopCardRect(index) {
+    const w = 380, h = 170, gap = 30;
+    const total = UPGRADES.length * w + (UPGRADES.length - 1) * gap;
+    return { x: (GAME.width - total) / 2 + index * (w + gap), y: 560, w: w, h: h };
+}
+canvas.addEventListener('click', (event) => {
+    if (screen !== 'menu') return;
+    const rect = canvas.getBoundingClientRect();
+    const x = (event.clientX - rect.left) * (GAME.width / rect.width);
+    const y = (event.clientY - rect.top) * (GAME.height / rect.height);
+    for (let i = 0; i < UPGRADES.length; i++) {
+        const r = shopCardRect(i);
+        if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) buyUpgrade(i);
     }
 });
 window.addEventListener('keyup', (event) => { setKey(event, false); });
@@ -112,8 +182,17 @@ function spawnEnemy() {
         default: x = Math.random() * GAME.width; y = GAME.height + margin; break; // снизу
     }
 
+    // Стрелки появляются не сразу, а через 15 секунд после начала
+    const rangedChance = gameState.time > 15 ? 0.2 : 0;
+    const roll = Math.random();
     let enemy;
-    if (Math.random() <= 0.45) {
+    if (roll < rangedChance) {
+        // Дальний бой, мало хп: держит дистанцию и стреляет
+        enemy = {
+            health: 60, maxHealth: 60, radius: 24, damage: 10, color: 'purple', enemy_x: x, enemy_y: y, speed: 120,
+            ranged: true, range: 420, shotDamage: 12, shotSpeed: 420, fireRate: 2, shotTimer: 1 + Math.random()
+        };
+    } else if (roll < rangedChance + (1 - rangedChance) * 0.45) {
         // Ближний бой, больше хп, медленный
         enemy = { health: 150, maxHealth: 150, radius: 32, damage: 20, color: 'green', enemy_x: x, enemy_y: y, speed: 80 };
     } else {
@@ -147,9 +226,39 @@ function updateEnemies(dt) {
         const dx = px - enemy.enemy_x;
         const dy = py - enemy.enemy_y;
         const distance = Math.hypot(dx, dy);
-        if (distance > 1) {
-            enemy.enemy_x += (dx / distance) * enemy.speed * dt;
-            enemy.enemy_y += (dy / distance) * enemy.speed * dt;
+        if (distance <= 1) continue;
+        const nx = dx / distance, ny = dy / distance;
+
+        if (enemy.ranged) {
+            // Стрелок подходит на дистанцию выстрела, а если игрок слишком близко — отходит
+            let dir = 0;
+            if (distance > enemy.range) dir = 1;
+            else if (distance < enemy.range * 0.6) dir = -0.7;
+            if (dir !== 0) {
+                enemy.enemy_x += nx * enemy.speed * dir * dt;
+                enemy.enemy_y += ny * enemy.speed * dir * dt;
+                // Не убегает за экран, если уже на нём
+                if (isOnScreen(enemy)) {
+                    enemy.enemy_x = Math.max(enemy.radius, Math.min(enemy.enemy_x, GAME.width - enemy.radius));
+                    enemy.enemy_y = Math.max(enemy.radius, Math.min(enemy.enemy_y, GAME.height - enemy.radius));
+                }
+            }
+            // Стреляет, только когда виден на экране и в радиусе
+            enemy.shotTimer -= dt;
+            if (enemy.shotTimer <= 0 && isOnScreen(enemy) && distance <= enemy.range * 1.2) {
+                gameState.bullets.push({
+                    x: enemy.enemy_x,
+                    y: enemy.enemy_y,
+                    dx: nx * enemy.shotSpeed,
+                    dy: ny * enemy.shotSpeed,
+                    damage: enemy.shotDamage,
+                    isEnemy: true
+                });
+                enemy.shotTimer = enemy.fireRate;
+            }
+        } else {
+            enemy.enemy_x += nx * enemy.speed * dt;
+            enemy.enemy_y += ny * enemy.speed * dt;
         }
     }
 
@@ -176,25 +285,40 @@ function updateEnemies(dt) {
         const closestX = Math.max(player.x, Math.min(enemy.enemy_x, player.x + player.width));
         const closestY = Math.max(player.y, Math.min(enemy.enemy_y, player.y + player.height));
         const touching = Math.hypot(enemy.enemy_x - closestX, enemy.enemy_y - closestY) < enemy.radius;
-        if (touching && player.invulnerableTime <= 0) {
-            player.health = Math.max(0, player.health - enemy.damage);
-            player.invulnerableTime = 1; // 1 секунда неуязвимости
-            if (player.health <= 0) {
-                endGame(false);
-                return;
-            }
-        }
+        if (touching && damagePlayer(enemy.damage)) return;
     }
+}
+
+// Наносит урон игроку с учётом неуязвимости. Возвращает true, если игрок умер.
+function damagePlayer(amount) {
+    const player = gameState.player;
+    if (player.invulnerableTime > 0 || screen !== 'playing') return false;
+    player.health = Math.max(0, player.health - amount);
+    player.invulnerableTime = 1; // 1 секунда неуязвимости
+    if (player.health <= 0) {
+        endGame(false);
+        return true;
+    }
+    return false;
 }
 
 function drawEnemy(enemy) {
     const image = enemy.color === 'green' ? enemy1img : enemy2img;
     const size = enemy.radius * 2.8;
+    if (enemy.ranged) {
+        // У стрелка нет своей картинки: перекрашенный спрайт + фиолетовая аура
+        canvasContext.fillStyle = 'rgba(160, 60, 255, 0.35)';
+        canvasContext.beginPath();
+        canvasContext.arc(enemy.enemy_x, enemy.enemy_y, enemy.radius + 8, 0, Math.PI * 2);
+        canvasContext.fill();
+    }
     if (imgReady(image)) {
         // Сохраняем пропорции картинки
         const ratio = image.naturalHeight / image.naturalWidth;
         const w = size, h = size * ratio;
+        if (enemy.ranged) canvasContext.filter = 'hue-rotate(220deg) saturate(1.5)';
         canvasContext.drawImage(image, enemy.enemy_x - w / 2, enemy.enemy_y - h / 2, w, h);
+        canvasContext.filter = 'none';
     } else {
         canvasContext.fillStyle = enemy.color;
         canvasContext.beginPath();
@@ -273,7 +397,15 @@ function updateBullets(dt) {
             bullets.splice(i, 1);
             continue;
         }
-        if (bullet.isEnemy) continue;
+        if (bullet.isEnemy) {
+            // Вражеский снаряд попадает в игрока (хитбокс чуть уже спрайта)
+            const p = gameState.player;
+            if (bullet.x > p.x + 20 && bullet.x < p.x + p.width - 20 && bullet.y > p.y + 10 && bullet.y < p.y + p.height - 10) {
+                bullets.splice(i, 1);
+                if (damagePlayer(bullet.damage)) return;
+            }
+            continue;
+        }
 
         for (let j = 0; j < enemies.length; j++) {
             const enemy = enemies[j];
@@ -282,7 +414,7 @@ function updateBullets(dt) {
                 if (enemy.health <= 0) {
                     enemies.splice(j, 1);
                     gameState.kills++;
-                    gameState.xp += enemy.color === 'green' ? 15 : 10;
+                    gameState.xp += enemy.color === 'green' ? 15 : enemy.ranged ? 12 : 10;
                 }
                 bullets.splice(i, 1);
                 break;
@@ -350,6 +482,103 @@ function drawHealthBarPlayer() {
     canvasContext.fillRect(player.x, player.y - 40, player.width * part, 25);
 }
 
+// ===================== Бонусы на карте =====================
+const PICKUP_TYPES = {
+    heal:     { color: '#2ecc40', icon: '+', label: '+30 HP' },
+    damage:   { color: '#ff4136', icon: '⚔', label: '+10 урон' },
+    fireRate: { color: '#ffdc00', icon: '»', label: 'скорострельность +10%' }
+};
+const PICKUP_RADIUS = 22;
+const PICKUP_LIFETIME = 12; // секунд лежит на карте
+const MAX_PICKUPS = 3;
+
+function spawnPickup() {
+    const types = Object.keys(PICKUP_TYPES);
+    const player = gameState.player;
+    let x, y, tries = 0;
+    // Не прямо под игроком
+    do {
+        x = 80 + Math.random() * (GAME.width - 160);
+        y = 140 + Math.random() * (GAME.height - 220);
+        tries++;
+    } while (tries < 20 && Math.hypot(x - (player.x + player.width / 2), y - (player.y + player.height / 2)) < 250);
+    gameState.pickups.push({ type: types[Math.floor(Math.random() * types.length)], x: x, y: y, life: PICKUP_LIFETIME });
+}
+
+function applyPickup(pickup) {
+    const player = gameState.player;
+    if (pickup.type === 'heal') {
+        player.health = Math.min(player.maxHealth, player.health + 30);
+    } else if (pickup.type === 'damage') {
+        player.damage += 10;
+    } else if (pickup.type === 'fireRate') {
+        player.fireRate = Math.max(0.12, player.fireRate * 0.9);
+    }
+    gameState.popups.push({ text: PICKUP_TYPES[pickup.type].label, x: pickup.x, y: pickup.y, life: 1.2, color: PICKUP_TYPES[pickup.type].color });
+}
+
+function updatePickups(dt) {
+    gameState.pickupTimer -= dt;
+    if (gameState.pickupTimer <= 0) {
+        if (gameState.pickups.length < MAX_PICKUPS) spawnPickup();
+        gameState.pickupTimer = 6 + Math.random() * 4;
+    }
+    const p = gameState.player;
+    for (let i = gameState.pickups.length - 1; i >= 0; i--) {
+        const pickup = gameState.pickups[i];
+        pickup.life -= dt;
+        const closestX = Math.max(p.x, Math.min(pickup.x, p.x + p.width));
+        const closestY = Math.max(p.y, Math.min(pickup.y, p.y + p.height));
+        if (Math.hypot(pickup.x - closestX, pickup.y - closestY) < PICKUP_RADIUS) {
+            applyPickup(pickup);
+            gameState.pickups.splice(i, 1);
+        } else if (pickup.life <= 0) {
+            gameState.pickups.splice(i, 1);
+        }
+    }
+    for (let i = gameState.popups.length - 1; i >= 0; i--) {
+        const popup = gameState.popups[i];
+        popup.life -= dt;
+        popup.y -= 40 * dt;
+        if (popup.life <= 0) gameState.popups.splice(i, 1);
+    }
+}
+
+function drawPickups() {
+    for (const pickup of gameState.pickups) {
+        // Мигает последние 3 секунды перед исчезновением
+        if (pickup.life < 3 && Math.floor(pickup.life * 6) % 2 === 0) continue;
+        const t = PICKUP_TYPES[pickup.type];
+        const bob = Math.sin(pickup.life * 4) * 4;
+        canvasContext.fillStyle = 'rgba(0,0,0,0.35)';
+        canvasContext.beginPath();
+        canvasContext.ellipse(pickup.x, pickup.y + PICKUP_RADIUS + 6, PICKUP_RADIUS * 0.8, 6, 0, 0, Math.PI * 2);
+        canvasContext.fill();
+        canvasContext.fillStyle = t.color;
+        canvasContext.strokeStyle = 'white';
+        canvasContext.lineWidth = 3;
+        canvasContext.beginPath();
+        canvasContext.arc(pickup.x, pickup.y + bob, PICKUP_RADIUS, 0, Math.PI * 2);
+        canvasContext.fill();
+        canvasContext.stroke();
+        canvasContext.fillStyle = 'black';
+        canvasContext.font = 'bold 26px Arial';
+        canvasContext.textAlign = 'center';
+        canvasContext.textBaseline = 'middle';
+        canvasContext.fillText(t.icon, pickup.x, pickup.y + bob + 1);
+        canvasContext.textAlign = 'left';
+        canvasContext.textBaseline = 'alphabetic';
+    }
+}
+
+function drawPopups() {
+    for (const popup of gameState.popups) {
+        canvasContext.globalAlpha = Math.min(1, popup.life * 2);
+        drawText(popup.text, popup.x, popup.y - 30, 30, 'center');
+        canvasContext.globalAlpha = 1;
+    }
+}
+
 // ===================== Интерфейс =====================
 function formatTime(sec) {
     sec = Math.floor(sec);
@@ -382,17 +611,44 @@ function drawHUD() {
     const left = Math.max(0, GAME.winTime - gameState.time);
     drawText('Time: ' + formatTime(gameState.time) + '  (до победы ' + formatTime(left) + ')', 20, 50, 40);
     drawText('Kills: ' + gameState.kills + '   XP: ' + gameState.xp, 20, 100, 36);
+    const p = gameState.player;
+    drawText('Урон: ' + p.damage + '   Выстрелов/сек: ' + (1 / p.fireRate).toFixed(1), 20, 145, 30);
 }
 
-function drawMenu() {
+function drawMenu(dt) {
     drawBack();
-    canvasContext.fillStyle = 'rgba(0,0,0,0.45)';
+    canvasContext.fillStyle = 'rgba(0,0,0,0.5)';
     canvasContext.fillRect(0, 0, GAME.width, GAME.height);
-    drawText('Bow and Elementals', GAME.width / 2, GAME.height / 2 - 120, 110, 'center');
-    drawText('Продержись ' + formatTime(GAME.winTime) + '. Лучник стреляет сам.', GAME.width / 2, GAME.height / 2, 44, 'center');
-    drawText('Движение: стрелки или WASD', GAME.width / 2, GAME.height / 2 + 60, 40, 'center');
-    drawText('Нажми Enter, чтобы начать', GAME.width / 2, GAME.height / 2 + 160, 56, 'center');
-    drawText('Всего опыта: ' + totalXP, GAME.width / 2, GAME.height - 60, 36, 'center');
+    drawText('Bow and Elementals', GAME.width / 2, 170, 110, 'center');
+    drawText('Продержись ' + formatTime(GAME.winTime) + '. Лучник стреляет сам. Собирай бонусы на карте.', GAME.width / 2, 260, 40, 'center');
+    drawText('Движение: стрелки или WASD', GAME.width / 2, 315, 36, 'center');
+    drawText('Нажми Enter, чтобы начать', GAME.width / 2, 420, 56, 'center');
+
+    // Магазин улучшений
+    drawText('Улучшения — опыт: ' + totalXP, GAME.width / 2, 525, 44, 'center');
+    for (let i = 0; i < UPGRADES.length; i++) {
+        const u = UPGRADES[i];
+        const r = shopCardRect(i);
+        const level = upgradeLevels[u.id];
+        const maxed = level >= u.maxLevel;
+        const affordable = !maxed && totalXP >= upgradeCost(u);
+        canvasContext.fillStyle = maxed ? 'rgba(60,60,60,0.85)' : affordable ? 'rgba(30,90,40,0.9)' : 'rgba(40,40,40,0.85)';
+        canvasContext.fillRect(r.x, r.y, r.w, r.h);
+        canvasContext.strokeStyle = affordable ? '#7fff7f' : '#888';
+        canvasContext.lineWidth = 3;
+        canvasContext.strokeRect(r.x, r.y, r.w, r.h);
+        const cx = r.x + r.w / 2;
+        drawText('[' + u.key + '] ' + u.name, cx, r.y + 45, 34, 'center');
+        drawText(u.desc, cx, r.y + 85, 26, 'center');
+        drawText('Ур. ' + level + ' / ' + u.maxLevel, cx, r.y + 120, 26, 'center');
+        drawText(maxed ? 'МАКС' : 'Цена: ' + upgradeCost(u) + ' XP', cx, r.y + 155, 28, 'center');
+    }
+    drawText('Нажми 1–4 или кликни по карточке, чтобы купить', GAME.width / 2, 790, 30, 'center');
+
+    if (shopMessageTimer > 0) {
+        shopMessageTimer -= dt;
+        drawText(shopMessage, GAME.width / 2, 860, 40, 'center');
+    }
 }
 
 function drawEndScreen(isWin) {
@@ -403,7 +659,8 @@ function drawEndScreen(isWin) {
     drawText('Time: ' + formatTime(gameState.time) + '   Kills: ' + gameState.kills + '   +' + gameState.xp + ' XP',
         GAME.width / 2, GAME.height / 2 + 50, 44, 'center');
     drawText('Всего опыта: ' + totalXP, GAME.width / 2, GAME.height / 2 + 110, 36, 'center');
-    drawText('Нажми Enter, чтобы сыграть ещё', GAME.width / 2, GAME.height / 2 + 200, 50, 'center');
+    drawText('Enter — сыграть ещё', GAME.width / 2, GAME.height / 2 + 200, 50, 'center');
+    drawText('M или Esc — в меню (потратить опыт)', GAME.width / 2, GAME.height / 2 + 260, 40, 'center');
 }
 
 function endGame(isWin) {
@@ -425,16 +682,19 @@ function update(dt) {
     updateSpawning(dt);
     updateEnemies(dt);
     if (screen !== 'playing') return; // игрок умер в этом кадре
+    updatePickups(dt);
     updateShooting(dt);
     updateBullets(dt);
 }
 
 function draw() {
     drawBack();
+    drawPickups();
     for (const enemy of gameState.enemies) drawEnemy(enemy);
     drawBullets();
     drawPlayer();
     drawHealthBarPlayer();
+    drawPopups();
     drawHUD();
 }
 
@@ -449,7 +709,7 @@ function play(now) {
         update(dt);
     }
     if (screen === 'playing') draw();
-    else if (screen === 'menu') drawMenu();
+    else if (screen === 'menu') drawMenu(dt);
     else drawEndScreen(screen === 'win');
 
     requestAnimationFrame(play);
