@@ -1,14 +1,14 @@
 // ===================== Картинки =====================
 const img = new Image();
-img.src = './back2.jpg';
+img.src = 'img/back2.jpg';
 img.onload = () => { GAME.background = img; };
 
 const enemy1img = new Image();
-enemy1img.src = 'enemy1.png';
+enemy1img.src = 'img/enemy1.png';
 const enemy2img = new Image();
-enemy2img.src = 'enemy2.png';
+enemy2img.src = 'img/enemy2.png';
 const heroimg = new Image();
-heroimg.src = './лучник.png';
+heroimg.src = 'img/лучник.png';
 
 function imgReady(image) {
     if (image instanceof HTMLCanvasElement) return true;
