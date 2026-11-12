@@ -7,9 +7,25 @@ var GAME = {
     background: null,
     winTime: 120,           // секунд до победы
     maxEnemies: 15,         // стартовый лимит врагов
-    maxEnemiesCap: 45,      // лимит врагов к 2:00 (в бесконечном режиме растёт дальше)
+    maxEnemiesCap: 55,      // лимит врагов к 2:00 (в бесконечном режиме растёт дальше)
     spawnInterval: 1.1,     // секунд между спавнами в начале
-    spawnIntervalMin: 0.3   // интервал спавна к 2:00
+    spawnIntervalMin: 0.25  // интервал спавна к 2:00
+};
+
+// Цифры баланса в одном месте, чтобы их было удобно крутить
+const BALANCE = {
+    hpGrowth: 0.9,              // на сколько вырастает хп врагов к 2:00 (0.9 = +90%)
+    rangedChanceStart: 0.2,     // доля стрелков с 0:15
+    rangedChanceEnd: 0.3,       // доля стрелков к 2:00
+    minFireRate: 0.14,          // быстрее этого лучник не стреляет, сколько бы бонусов ни набрал
+    // Бесконечный режим (после 2:00)
+    endlessHpMulPerMin: 2.0,    // хп врагов умножается на это каждую минуту
+    endlessDamagePerMin: 0.4,   // прибавка к урону врагов за минуту
+    endlessSpeedPerMin: 0.12,   // прибавка к скорости врагов за минуту
+    endlessSpeedMax: 0.8,
+    endlessBossHp: 1.7,         // множитель хп каждого следующего босса
+    endlessMaxEnemies: 110,     // потолок числа врагов
+    endlessXpShare: 0.1         // какая доля опыта, собранного после 2:00, идёт в общий опыт
 };
 
 var canvas = document.getElementById('canvas');
@@ -30,8 +46,187 @@ const heroimg = new Image();
 heroimg.src = './лучник.png';
 
 function imgReady(image) {
+    if (image instanceof HTMLCanvasElement) return true;
     return image.complete && image.naturalWidth > 0;
 }
+function imgSize(image) {
+    return { w: image.naturalWidth || image.width, h: image.naturalHeight || image.height };
+}
+
+// ===================== Спрайты, нарисованные кодом (стрелок и боссы) =====================
+// Рисуются один раз при загрузке в стиле остальных врагов — глянцевые стихийные сферы.
+// R — радиус сферы; начало координат в её центре.
+function makeSprite(size, paint) {
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const g = c.getContext('2d');
+    g.translate(size / 2, size / 2);
+    paint(g, size * 0.36);
+    return c;
+}
+
+function paintOrb(g, R, colors) {
+    const glow = g.createRadialGradient(0, 0, R * 0.8, 0, 0, R * 1.3);
+    glow.addColorStop(0, colors.glow);
+    glow.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = glow;
+    g.beginPath(); g.arc(0, 0, R * 1.3, 0, Math.PI * 2); g.fill();
+
+    const body = g.createRadialGradient(-R * 0.3, -R * 0.35, R * 0.1, 0, 0, R * 1.05);
+    body.addColorStop(0, colors.light);
+    body.addColorStop(0.55, colors.mid);
+    body.addColorStop(1, colors.dark);
+    g.fillStyle = body;
+    g.beginPath(); g.arc(0, 0, R, 0, Math.PI * 2); g.fill();
+}
+
+function paintGloss(g, R) {
+    g.fillStyle = 'rgba(255,255,255,0.35)';
+    g.beginPath(); g.ellipse(-R * 0.4, -R * 0.55, R * 0.3, R * 0.14, -0.6, 0, Math.PI * 2); g.fill();
+}
+
+function paintPolygon(g, R, points) {
+    g.beginPath();
+    points.forEach((pt, i) => (i ? g.lineTo(pt[0] * R, pt[1] * R) : g.moveTo(pt[0] * R, pt[1] * R)));
+    g.closePath();
+}
+
+// Глазницы; зрачки рисуются в игре и следят за лучником
+function paintEyeSockets(g, R, eyes) {
+    for (const eye of eyes) {
+        g.fillStyle = 'rgba(0,0,0,0.55)';
+        g.beginPath(); g.arc(eye[0] * R, eye[1] * R, eye[2] * R * 1.18, 0, Math.PI * 2); g.fill();
+        g.fillStyle = '#fffbe8';
+        g.beginPath(); g.arc(eye[0] * R, eye[1] * R, eye[2] * R, 0, Math.PI * 2); g.fill();
+    }
+}
+
+const RANGED_EYES = [[0, -0.02, 0.34]];
+const GUARDIAN_EYES = [[-0.36, -0.16, 0.19], [0.36, -0.16, 0.19]];
+const LORD_EYES = [[0, -0.05, 0.33], [-0.58, -0.36, 0.13], [0.58, -0.36, 0.13], [-0.46, 0.5, 0.11], [0.46, 0.5, 0.11]];
+
+const SPRITES = {
+    // Стрелок — грозовой дух с одним глазом
+    ranged: {
+        eyes: RANGED_EYES, iris: '#ffc21a',
+        orbit: { count: 4, dist: 1.45, size: 0.2, speed: 2.4, shape: 'shard', color: '#cfeeff', edge: '#3b6cff' },
+        image: makeSprite(192, (g, R) => {
+            paintOrb(g, R, { glow: 'rgba(110,170,255,0.6)', light: '#e6fbff', mid: '#4a8dff', dark: '#1b1670' });
+            g.lineCap = 'round';
+            g.strokeStyle = 'rgba(210,244,255,0.6)';
+            g.lineWidth = R * 0.09;
+            for (let i = 0; i < 3; i++) {
+                g.beginPath(); g.arc(0, 0, R * (0.55 + i * 0.16), 0.6 + i * 2.1, 2.1 + i * 2.1); g.stroke();
+            }
+            // Разряды
+            g.strokeStyle = '#fff7a8';
+            g.lineWidth = R * 0.055;
+            g.lineJoin = 'round';
+            for (const bolt of [[[-0.85, 0.2], [-0.6, 0.38], [-0.68, 0.52], [-0.4, 0.75]], [[0.5, -0.78], [0.62, -0.52], [0.5, -0.46], [0.8, -0.2]]]) {
+                g.beginPath();
+                bolt.forEach((pt, i) => (i ? g.lineTo(pt[0] * R, pt[1] * R) : g.moveTo(pt[0] * R, pt[1] * R)));
+                g.stroke();
+            }
+            paintEyeSockets(g, R, RANGED_EYES);
+            paintGloss(g, R);
+        })
+    },
+    // Босс "Страж леса" — моховая сфера в каменной броне, с рогами
+    guardian: {
+        eyes: GUARDIAN_EYES, iris: '#ffb300',
+        orbit: { count: 6, dist: 1.5, size: 0.17, speed: 0.9, shape: 'leaf', color: '#9be84f', edge: '#2f6b1c' },
+        image: makeSprite(320, (g, R) => {
+            // Рога (за сферой)
+            for (const side of [-1, 1]) {
+                g.fillStyle = '#7a5530';
+                g.strokeStyle = '#2c1d10';
+                g.lineWidth = R * 0.05;
+                g.beginPath();
+                g.moveTo(side * R * 0.35, -R * 0.85);
+                g.quadraticCurveTo(side * R * 0.5, -R * 1.25, side * R * 1.0, -R * 1.28);
+                g.quadraticCurveTo(side * R * 0.75, -R * 1.0, side * R * 0.75, -R * 0.6);
+                g.closePath();
+                g.fill(); g.stroke();
+            }
+            paintOrb(g, R, { glow: 'rgba(150,255,90,0.45)', light: '#dcff8f', mid: '#4da32f', dark: '#123d18' });
+            // Каменные пластины и светящиеся трещины между ними
+            const plates = [
+                [[-1.1, 0.12], [-0.6, 0.0], [-0.36, 0.42], [-0.62, 1.05], [-1.1, 0.95]],
+                [[0.32, 0.4], [0.74, 0.02], [1.1, 0.16], [1.1, 1.0], [0.48, 1.0]],
+                [[-0.26, 0.62], [0.18, 0.54], [0.34, 1.1], [-0.42, 1.1]],
+                [[-0.55, -1.1], [0.5, -1.1], [0.34, -0.72], [-0.06, -0.6], [-0.42, -0.74]]
+            ];
+            g.save();
+            g.beginPath(); g.arc(0, 0, R, 0, Math.PI * 2); g.clip();
+            for (const plate of plates) {
+                paintPolygon(g, R, plate);
+                g.fillStyle = '#5d4832';
+                g.fill();
+                g.strokeStyle = '#eaff7a';
+                g.lineWidth = R * 0.045;
+                g.stroke();
+                g.strokeStyle = 'rgba(0,0,0,0.35)';
+                g.lineWidth = R * 0.02;
+                g.stroke();
+            }
+            g.restore();
+            // Сердитые брови
+            g.strokeStyle = '#2c1d10';
+            g.lineWidth = R * 0.1;
+            g.lineCap = 'round';
+            for (const side of [-1, 1]) {
+                g.beginPath(); g.moveTo(side * R * 0.6, -R * 0.48); g.lineTo(side * R * 0.16, -R * 0.3); g.stroke();
+            }
+            // Пасть
+            g.strokeStyle = '#eaff7a';
+            g.lineWidth = R * 0.06;
+            g.lineJoin = 'round';
+            g.beginPath();
+            [[-0.32, 0.22], [-0.18, 0.32], [-0.06, 0.2], [0.06, 0.32], [0.18, 0.2], [0.32, 0.3]]
+                .forEach((pt, i) => (i ? g.lineTo(pt[0] * R, pt[1] * R) : g.moveTo(pt[0] * R, pt[1] * R)));
+            g.stroke();
+            paintEyeSockets(g, R, GUARDIAN_EYES);
+            paintGloss(g, R);
+        })
+    },
+    // Босс "Повелитель роя" — тёмная многоглазая сфера с короной шипов
+    lord: {
+        eyes: LORD_EYES, iris: '#22e3ff',
+        orbit: { count: 7, dist: 1.55, size: 0.13, speed: 1.6, shape: 'orb', color: '#5af0ff', edge: '#1a0733' },
+        image: makeSprite(320, (g, R) => {
+            // Корона шипов (за сферой)
+            for (let i = 0; i < 7; i++) {
+                const a = -Math.PI / 2 + (i - 3) * 0.33;
+                const tip = i % 2 ? 1.2 : 1.33;
+                g.fillStyle = '#2a0845';
+                g.strokeStyle = '#5af0ff';
+                g.lineWidth = R * 0.03;
+                g.beginPath();
+                g.moveTo(Math.cos(a - 0.13) * R * 0.9, Math.sin(a - 0.13) * R * 0.9);
+                g.lineTo(Math.cos(a) * R * tip, Math.sin(a) * R * tip);
+                g.lineTo(Math.cos(a + 0.13) * R * 0.9, Math.sin(a + 0.13) * R * 0.9);
+                g.closePath();
+                g.fill(); g.stroke();
+            }
+            paintOrb(g, R, { glow: 'rgba(80,230,255,0.5)', light: '#bd92ff', mid: '#4a1a8a', dark: '#0d0420' });
+            // Закрученные полосы, как у обычных врагов
+            g.save();
+            g.beginPath(); g.arc(0, 0, R, 0, Math.PI * 2); g.clip();
+            for (let i = 0; i < 4; i++) {
+                const y = R * (-0.75 + i * 0.5);
+                g.strokeStyle = '#1a0733';
+                g.lineWidth = R * 0.15;
+                g.beginPath(); g.ellipse(R * 0.1, y, R * 1.15, R * 0.3, -0.4, 0.15, Math.PI - 0.15); g.stroke();
+                g.strokeStyle = 'rgba(90,240,255,0.75)';
+                g.lineWidth = R * 0.03;
+                g.beginPath(); g.ellipse(R * 0.1, y + R * 0.08, R * 1.15, R * 0.3, -0.4, 0.15, Math.PI - 0.15); g.stroke();
+            }
+            g.restore();
+            paintEyeSockets(g, R, LORD_EYES);
+            paintGloss(g, R);
+        })
+    }
+};
 
 // ===================== Сохранения =====================
 function loadJSON(key, fallback) {
@@ -66,11 +261,14 @@ function updateRecords() {
 
 // ===================== Улучшения (покупаются за опыт в меню) =====================
 const UPGRADES = [
-    { id: 'health',   key: '1', name: 'Здоровье',         desc: '+20 к макс. хп',      maxLevel: 5, baseCost: 40 },
-    { id: 'damage',   key: '2', name: 'Урон',             desc: '+10 к урону стрел',   maxLevel: 5, baseCost: 50 },
-    { id: 'fireRate', key: '3', name: 'Скорострельность', desc: '-8% к перезарядке',   maxLevel: 5, baseCost: 50 },
-    { id: 'speed',    key: '4', name: 'Скорость',         desc: '+8% к скорости бега', maxLevel: 5, baseCost: 30 }
+    { id: 'health',   key: '1', name: 'Здоровье',         desc: '+20 к макс. хп',      maxLevel: 5, baseCost: 100 },
+    { id: 'damage',   key: '2', name: 'Урон',             desc: '+10 к урону стрел',   maxLevel: 5, baseCost: 150 },
+    { id: 'fireRate', key: '3', name: 'Скорострельность', desc: '-8% к перезарядке',   maxLevel: 5, baseCost: 150 },
+    { id: 'speed',    key: '4', name: 'Скорость',         desc: '+8% к скорости бега', maxLevel: 5, baseCost: 80 }
 ];
+// Во сколько раз дороже базовой цены каждый следующий уровень.
+// Весь магазин стоит 12 000 опыта — это примерно 10 победных раундов.
+const UPGRADE_COST_MUL = [1, 2, 4, 7, 11];
 
 function loadUpgrades() {
     const levels = { health: 0, damage: 0, fireRate: 0, speed: 0 };
@@ -83,7 +281,7 @@ var shopMessage = '';
 var shopMessageTimer = 0;
 
 function upgradeCost(u) {
-    return u.baseCost * (upgradeLevels[u.id] + 1);
+    return u.baseCost * UPGRADE_COST_MUL[Math.min(upgradeLevels[u.id], UPGRADE_COST_MUL.length - 1)];
 }
 
 function buyUpgrade(index) {
@@ -125,7 +323,7 @@ const LEVEL_OPTIONS = [
       apply: p => { p.damage = Math.round(p.damage * 1.2); } },
     { id: 'fireRate', max: 6, name: () => 'Быстрая тетива',
       desc: p => 'Выстрелов в секунду: ' + (1 / p.fireRate).toFixed(1) + ' → ' + (1 / (p.fireRate * 0.88)).toFixed(1),
-      apply: p => { p.fireRate *= 0.88; } },
+      apply: p => { p.fireRate = Math.max(BALANCE.minFireRate, p.fireRate * 0.88); } },
     { id: 'multishot', max: 4, name: () => 'Ещё одна стрела',
       desc: p => 'Стрел за выстрел: ' + p.multishot + ' → ' + (p.multishot + 1),
       apply: p => { p.multishot++; } },
@@ -161,13 +359,13 @@ function xpForLevel(level) {
 
 // ===================== Боссы =====================
 const BOSS_TYPES = [
-    { name: 'Страж леса', image: enemy1img, filter: 'hue-rotate(-70deg) saturate(1.6)', radius: 70, health: 3000, speed: 75, damage: 30, attacks: ['ring', 'charge'] },
-    { name: 'Повелитель роя', image: enemy2img, filter: 'hue-rotate(110deg) saturate(1.5)', radius: 64, health: 5000, speed: 95, damage: 30, attacks: ['ring2', 'fan', 'charge'] }
+    { name: 'Страж леса', sprite: SPRITES.guardian, radius: 70, health: 2400, speed: 75, damage: 30, attacks: ['ring', 'charge'] },
+    { name: 'Повелитель роя', sprite: SPRITES.lord, radius: 64, health: 3600, speed: 95, damage: 30, attacks: ['ring2', 'fan', 'charge'] }
 ];
 
-// Когда появляется i-й босс: 0:45, 1:30, дальше (в бесконечном режиме) каждую минуту с 2:30
+// Когда появляется i-й босс: 0:40, 1:20, дальше (в бесконечном режиме) каждые 45 секунд с 2:30
 function bossTime(index) {
-    return index < 2 ? [45, 90][index] : 150 + (index - 2) * 60;
+    return index < 2 ? [40, 80][index] : 150 + (index - 2) * 45;
 }
 
 // ===================== Состояние игры =====================
@@ -235,6 +433,7 @@ function newGame() {
         pickupTimer: 5,
         kills: 0,
         xp: 0,
+        xpEndless: 0,         // сколько из этого опыта собрано в бесконечном режиме
         xpBanked: 0,          // сколько опыта этого забега уже добавлено в общий
         level: 1,
         levelXp: 0,
@@ -251,14 +450,26 @@ function newGame() {
 
 function startGame() {
     newGame();
+    gameState.debugUsed = debug.on && debug.god;
     screen = 'playing';
+}
+
+// Сколько опыта забега идёт в общий (для магазина).
+// Опыт, собранный в бесконечном режиме, засчитывается частично — иначе магазин обесценивается.
+function metaXP(g) {
+    return (g.xp - g.xpEndless) + Math.round(g.xpEndless * BALANCE.endlessXpShare);
 }
 
 // Добавляет опыт забега в общий и обновляет рекорды
 function finishRun() {
     const g = gameState;
-    totalXP += g.xp - g.xpBanked;
-    g.xpBanked = g.xp;
+    if (g.debugUsed) {
+        // Забег с читами в зачёт не идёт
+        g.newRecords = [];
+        return;
+    }
+    totalXP += metaXP(g) - g.xpBanked;
+    g.xpBanked = metaXP(g);
     saveXP(totalXP);
     g.newRecords = updateRecords();
 }
@@ -330,15 +541,98 @@ function digitKey(code, max) {
     return n <= max ? n - 1 : -1;
 }
 
+// ===================== Режим отладки =====================
+// Включается клавишей F2 или адресом с ?debug. Нужен, чтобы быстро проверять новые вещи.
+// Если в забеге использовались читы, его опыт и рекорды не сохраняются.
+var debug = {
+    on: /[?&]debug\b/.test(location.search),
+    god: false,
+    hitboxes: false,
+    fps: 0, frames: 0, fpsTimer: 0,
+    bossCounter: 0
+};
+
+const DEBUG_ACTIONS = [
+    { key: '1', name: '+1 уровень', run: g => collectGem({ value: xpForLevel(g.level) - g.levelXp }) },
+    { key: '2', name: '+15 секунд', run: g => { g.time += 15; } },
+    { key: '3', name: 'призвать босса', run: () => spawnBoss(debug.bossCounter++ % BOSS_TYPES.length) },
+    { key: '4', name: 'убить всех врагов', run: g => { for (const e of g.enemies) hitEnemy(e, Math.max(1, e.health)); } },
+    { key: '5', name: 'полное лечение', run: g => { g.player.health = g.player.maxHealth; } },
+    { key: '6', name: 'бессмертие', run: () => { debug.god = !debug.god; }, state: () => debug.god },
+    { key: '7', name: '+10 врагов', run: () => { for (let i = 0; i < 10; i++) spawnEnemy(); } },
+    { key: '8', name: 'случайный бонус', run: () => spawnPickup() },
+    { key: '9', name: 'сменить стихию', run: g => {
+        const i = ELEMENTS.findIndex(el => el.id === g.player.element);
+        g.player.element = ELEMENTS[(i + 1) % ELEMENTS.length].id;
+    } },
+    { key: '0', name: 'показать хитбоксы', run: () => { debug.hitboxes = !debug.hitboxes; }, state: () => debug.hitboxes, cosmetic: true }
+];
+
+function debugAction(digit) {
+    const action = DEBUG_ACTIONS.find(a => a.key === digit);
+    if (!action) return;
+    action.run(gameState);
+    if (!action.cosmetic) gameState.debugUsed = true;
+}
+
+function debugResetProgress() {
+    totalXP = 0;
+    for (const u of UPGRADES) upgradeLevels[u.id] = 0;
+    records = { time: 0, kills: 0, level: 0 };
+    saveXP(totalXP);
+    saveJSON('bae_upgrades', upgradeLevels);
+    saveJSON('bae_records', records);
+    shopMessage = 'Отладка: прогресс сброшен';
+    shopMessageTimer = 2;
+}
+
+function drawDebugPanel() {
+    const g = gameState;
+    const lines = [
+        'ОТЛАДКА (F2 — выключить)',
+        'FPS ' + debug.fps + ' · врагов ' + g.enemies.length + ' · снарядов ' + g.bullets.length,
+        'частиц ' + g.particles.length + ' · кристаллов ' + g.gems.length + ' · хп врагов x' + difficultyMul().toFixed(2)
+    ];
+    for (const a of DEBUG_ACTIONS) lines.push('[' + a.key + '] ' + a.name + (a.state ? (a.state() ? ' — ВКЛ' : ' — выкл') : ''));
+    const w = 400, lineH = 24, x = GAME.width - w - 20, y = 80;
+    drawPanel({ x: x, y: y, w: w, h: lines.length * lineH + 16 }, 'rgba(0,0,0,0.6)', '#ff4dff', 2);
+    lines.forEach((line, i) => drawText(line, x + 12, y + 26 + i * lineH, 18, 'left', i === 0 ? '#ff4dff' : '#ffffff'));
+}
+
+function drawDebugHitboxes() {
+    const g = gameState;
+    canvasContext.lineWidth = 2;
+    canvasContext.strokeStyle = '#ff4dff';
+    for (const e of g.enemies) {
+        if (e.dead) continue;
+        canvasContext.beginPath(); canvasContext.arc(e.x, e.y, e.radius, 0, Math.PI * 2); canvasContext.stroke();
+    }
+    for (const b of g.bullets) {
+        canvasContext.beginPath(); canvasContext.arc(b.x, b.y, b.isEnemy ? b.radius : 6, 0, Math.PI * 2); canvasContext.stroke();
+    }
+    const hb = playerHitbox();
+    canvasContext.strokeStyle = '#00ffff';
+    canvasContext.strokeRect(hb.x, hb.y, hb.w, hb.h);
+}
+
 window.addEventListener('keydown', (event) => {
     const code = event.code;
     if (setKey(event, true) || code === 'Space') event.preventDefault(); // стрелки и пробел не прокручивают страницу
     if (event.repeat) return;
 
+    if (code === 'F2') {
+        event.preventDefault();
+        debug.on = !debug.on;
+        if (!debug.on) { debug.god = false; debug.hitboxes = false; }
+        return;
+    }
+
     switch (screen) {
         case 'playing':
             if (code === 'ShiftLeft' || code === 'ShiftRight' || code === 'Space') tryDash();
             else if (code === 'Escape' || code === 'KeyP') screen = 'paused';
+            else if (debug.on && digitKey(code, 9) >= 0) debugAction(String(digitKey(code, 9) + 1));
+            else if (debug.on && (code === 'Digit0' || code === 'Numpad0')) debugAction('0');
             break;
         case 'paused':
             if (code === 'Escape' || code === 'KeyP' || code === 'Enter') screen = 'playing';
@@ -355,6 +649,12 @@ window.addEventListener('keydown', (event) => {
             else if (i >= 0) buyUpgrade(i);
             else if (code === 'KeyQ' || code === 'ArrowLeft') selectElement(selectedElement - 1);
             else if (code === 'KeyE' || code === 'ArrowRight') selectElement(selectedElement + 1);
+            else if (debug.on && code === 'KeyX') {
+                totalXP += 1000;
+                saveXP(totalXP);
+                shopMessage = 'Отладка: +1000 опыта';
+                shopMessageTimer = 2;
+            } else if (debug.on && code === 'KeyR') debugResetProgress();
             break;
         }
         case 'win':
@@ -556,12 +856,24 @@ function randomSpawnPoint(margin) {
 // Враги становятся крепче со временем
 function difficultyMul() {
     const t = gameState.time;
-    return 1 + Math.min(t, GAME.winTime) / GAME.winTime * 0.5 + Math.max(0, t - GAME.winTime) / 60 * 0.5;
+    return (1 + Math.min(t, GAME.winTime) / GAME.winTime * BALANCE.hpGrowth) * Math.pow(BALANCE.endlessHpMulPerMin, endlessMinutes());
+}
+
+// Сколько минут прошло в бесконечном режиме (0 до победы)
+function endlessMinutes() {
+    return Math.max(0, gameState.time - GAME.winTime) / 60;
+}
+function enemyDamageMul() {
+    return 1 + endlessMinutes() * BALANCE.endlessDamagePerMin;
+}
+function enemySpeedMul() {
+    return 1 + Math.min(BALANCE.endlessSpeedMax, endlessMinutes() * BALANCE.endlessSpeedPerMin);
 }
 
 function makeEnemy(base, x, y) {
     const enemy = Object.assign({
         x: x, y: y,
+        seed: Math.random() * 100, // чтобы враги "дышали" не в такт
         kbx: 0, kby: 0,   // отбрасывание
         flash: 0,         // белая вспышка при попадании
         burn: null,       // горение
@@ -575,15 +887,18 @@ function makeEnemy(base, x, y) {
 function spawnEnemy() {
     const pos = randomSpawnPoint(90);
     const hpMul = difficultyMul();
-    // Стрелки появляются не сразу, а через 15 секунд после начала
-    const rangedChance = gameState.time > 15 ? 0.2 : 0;
+    // Стрелки появляются не сразу, а через 15 секунд после начала; со временем их доля растёт
+    const progress = Math.min(1, gameState.time / GAME.winTime);
+    const rangedChance = gameState.time > 15
+        ? BALANCE.rangedChanceStart + (BALANCE.rangedChanceEnd - BALANCE.rangedChanceStart) * progress
+        : 0;
     const roll = Math.random();
     let base;
     if (roll < rangedChance) {
         // Дальний бой, мало хп: держит дистанцию и стреляет
         base = {
-            kind: 'ranged', health: 60, radius: 24, damage: 10, speed: 120, xp: 12,
-            range: 420, shotDamage: 12, shotSpeed: 420, fireRate: 2, shotTimer: 1 + Math.random()
+            kind: 'ranged', sprite: SPRITES.ranged, health: 60, radius: 24, damage: 10, speed: 120, xp: 12,
+            range: 420, shotDamage: Math.round(12 * enemyDamageMul()), shotSpeed: 420, fireRate: 2, shotTimer: 1 + Math.random()
         };
     } else if (roll < rangedChance + (1 - rangedChance) * 0.45) {
         // Ближний бой, больше хп, медленный
@@ -593,18 +908,22 @@ function spawnEnemy() {
         base = { kind: 'red', health: 100, radius: 28, damage: 15, speed: 165, xp: 10 };
     }
     base.health = Math.round(base.health * hpMul);
+    base.damage = Math.round(base.damage * enemyDamageMul());
+    base.speed *= enemySpeedMul();
     gameState.enemies.push(makeEnemy(base, pos.x, pos.y));
 }
 
 function spawnBoss(index) {
     const type = BOSS_TYPES[index % BOSS_TYPES.length];
-    const tier = Math.floor(index / BOSS_TYPES.length);
+    // Первые два босса обычные, каждый следующий (бесконечный режим) заметно крепче
+    const tier = Math.max(0, index - 1);
     const pos = randomSpawnPoint(160);
     gameState.enemies.push(makeEnemy({
-        kind: 'boss', boss: true, type: type,
-        health: Math.round(type.health * (1 + 0.7 * tier)),
-        radius: type.radius, damage: type.damage, speed: type.speed,
-        xp: 200 * (1 + tier),
+        kind: 'boss', boss: true, type: type, sprite: type.sprite,
+        health: Math.round(type.health * Math.pow(BALANCE.endlessBossHp, tier)),
+        radius: type.radius, damage: Math.round(type.damage * enemyDamageMul()), speed: type.speed,
+        shotDamage: Math.round(15 * enemyDamageMul()),
+        xp: 200 + 100 * tier,
         state: 'walk', stateTime: 0, attackTimer: 3, attackIndex: 0,
         chargeDirX: 0, chargeDirY: 0, pendingRing: 0
     }, pos.x, pos.y));
@@ -616,8 +935,8 @@ function updateSpawning(dt) {
     const g = gameState;
     // В бесконечном режиме progress становится больше 1 и сложность растёт дальше
     const progress = g.time / GAME.winTime;
-    const interval = Math.max(0.15, GAME.spawnInterval - (GAME.spawnInterval - GAME.spawnIntervalMin) * progress);
-    const limit = Math.min(80, Math.round(GAME.maxEnemies + (GAME.maxEnemiesCap - GAME.maxEnemies) * progress));
+    const interval = Math.max(0.1, GAME.spawnInterval - (GAME.spawnInterval - GAME.spawnIntervalMin) * progress);
+    const limit = Math.min(BALANCE.endlessMaxEnemies, Math.round(GAME.maxEnemies + (GAME.maxEnemiesCap - GAME.maxEnemies) * progress));
 
     g.spawnTimer -= dt;
     if (g.spawnTimer <= 0) {
@@ -646,14 +965,14 @@ function enemyBullet(x, y, angle, speed, damage, radius, color) {
 
 function fireRing(boss, count, speed, offset) {
     for (let i = 0; i < count; i++) {
-        enemyBullet(boss.x, boss.y, offset + i * Math.PI * 2 / count, speed, 15, 11, '255, 157, 60');
+        enemyBullet(boss.x, boss.y, offset + i * Math.PI * 2 / count, speed, boss.shotDamage, 11, '255, 157, 60');
     }
 }
 
 function fireFan(boss, nx, ny, count, spread, speed) {
     const base = Math.atan2(ny, nx);
     for (let i = 0; i < count; i++) {
-        enemyBullet(boss.x, boss.y, base + (i - (count - 1) / 2) * spread, speed, 15, 11, '255, 157, 60');
+        enemyBullet(boss.x, boss.y, base + (i - (count - 1) / 2) * spread, speed, boss.shotDamage, 11, '255, 157, 60');
     }
 }
 
@@ -826,14 +1145,17 @@ function hitEnemy(enemy, damage, opts) {
 }
 
 function enemyImage(enemy) {
-    if (enemy.boss) return enemy.type.image;
+    if (enemy.sprite) return enemy.sprite.image;
     return enemy.kind === 'green' ? enemy1img : enemy2img;
+}
+
+// Размер картинки врага на экране (у нарисованных кодом спрайтов поля шире — под рога и шипы)
+function enemyDrawSize(enemy) {
+    return enemy.sprite ? enemy.radius * 3.05 : enemy.radius * 2.8;
 }
 
 function enemyFilter(enemy) {
     const parts = [];
-    if (enemy.kind === 'ranged') parts.push('hue-rotate(220deg) saturate(1.5)');
-    if (enemy.boss) parts.push(enemy.type.filter);
     if (enemy.slow) parts.push('saturate(0.5) brightness(1.2)');
     if (enemy.flash > 0) parts.push('brightness(2.2)');
     return parts.length ? parts.join(' ') : 'none';
@@ -848,8 +1170,8 @@ function killEnemy(enemy) {
     spawnParticles(enemy.x, enemy.y, enemy.boss ? 40 : 12, color, enemy.boss ? 420 : 240, 0.5, enemy.boss ? 9 : 6);
     // "Труп" — спрайт, который сжимается и исчезает
     g.corpses.push({
-        image: enemyImage(enemy), filter: enemyFilter(Object.assign({}, enemy, { flash: 0, slow: null })),
-        x: enemy.x, y: enemy.y, size: enemy.radius * 2.8, life: 0.35, maxLife: 0.35,
+        image: enemyImage(enemy), filter: 'none',
+        x: enemy.x, y: enemy.y, size: enemyDrawSize(enemy), life: 0.35, maxLife: 0.35,
         spin: (Math.random() < 0.5 ? -1 : 1) * 2.5
     });
     if (enemy.boss) {
@@ -859,9 +1181,69 @@ function killEnemy(enemy) {
     }
 }
 
+// Спутники вокруг нарисованных кодом врагов: осколки, листья, шарики.
+// front = false рисует дальнюю половину орбиты (за врагом), true — ближнюю.
+function drawOrbiters(enemy, front) {
+    const orbit = enemy.sprite.orbit;
+    const R = enemy.radius * 1.1;
+    const t = gameState.time * orbit.speed + enemy.seed;
+    for (let i = 0; i < orbit.count; i++) {
+        const a = t + i * Math.PI * 2 / orbit.count;
+        if ((Math.sin(a) > 0) !== front) continue;
+        const x = enemy.x + Math.cos(a) * R * orbit.dist;
+        const y = enemy.y + Math.sin(a) * R * orbit.dist * 0.42;
+        const s = R * orbit.size * (0.85 + 0.25 * Math.sin(a)); // ближние чуть крупнее
+        canvasContext.save();
+        canvasContext.translate(x, y);
+        canvasContext.fillStyle = orbit.color;
+        canvasContext.strokeStyle = orbit.edge;
+        canvasContext.lineWidth = 2;
+        canvasContext.beginPath();
+        if (orbit.shape === 'shard') {
+            canvasContext.rotate(a * 2);
+            canvasContext.moveTo(0, -s * 1.5);
+            canvasContext.lineTo(s * 0.6, 0);
+            canvasContext.lineTo(0, s * 1.5);
+            canvasContext.lineTo(-s * 0.6, 0);
+            canvasContext.closePath();
+        } else if (orbit.shape === 'leaf') {
+            canvasContext.rotate(a + 0.8);
+            canvasContext.moveTo(-s * 1.4, 0);
+            canvasContext.quadraticCurveTo(0, -s * 1.1, s * 1.4, 0);
+            canvasContext.quadraticCurveTo(0, s * 1.1, -s * 1.4, 0);
+        } else {
+            canvasContext.arc(0, 0, s, 0, Math.PI * 2);
+        }
+        canvasContext.fill();
+        canvasContext.stroke();
+        canvasContext.restore();
+    }
+}
+
+// Зрачки, которые следят за лучником
+function drawPupils(enemy, scale) {
+    const p = gameState.player;
+    const R = enemy.radius * 1.1 * scale;
+    const dx = p.x + p.width / 2 - enemy.x, dy = p.y + p.height / 2 - enemy.y;
+    const d = Math.hypot(dx, dy) || 1;
+    for (const eye of enemy.sprite.eyes) {
+        const r = eye[2] * R;
+        const ex = enemy.x + eye[0] * R + dx / d * r * 0.34;
+        const ey = enemy.y + eye[1] * R + dy / d * r * 0.34;
+        canvasContext.fillStyle = enemy.sprite.iris;
+        canvasContext.beginPath(); canvasContext.arc(ex, ey, r * 0.62, 0, Math.PI * 2); canvasContext.fill();
+        canvasContext.fillStyle = '#12061c';
+        canvasContext.beginPath(); canvasContext.arc(ex, ey, r * 0.32, 0, Math.PI * 2); canvasContext.fill();
+        canvasContext.fillStyle = 'rgba(255,255,255,0.9)';
+        canvasContext.beginPath(); canvasContext.arc(ex - r * 0.18, ey - r * 0.2, r * 0.12, 0, Math.PI * 2); canvasContext.fill();
+    }
+}
+
 function drawEnemy(enemy) {
     const image = enemyImage(enemy);
-    const size = enemy.radius * 2.8;
+    // Враги слегка "дышат": размер плавно пульсирует
+    const pulse = 1 + 0.035 * Math.sin(gameState.time * 5 + enemy.seed);
+    const size = enemyDrawSize(enemy) * pulse;
 
     // Предупреждение перед рывком босса
     if (enemy.boss && enemy.state === 'telegraph') {
@@ -882,9 +1264,8 @@ function drawEnemy(enemy) {
     canvasContext.ellipse(enemy.x, enemy.y + size * 0.36, enemy.radius * 0.9, enemy.radius * 0.3, 0, 0, Math.PI * 2);
     canvasContext.fill();
 
-    // Ауры: стрелок, горение, лёд
+    // Ауры: горение, лёд
     const auras = [];
-    if (enemy.kind === 'ranged') auras.push('rgba(160, 60, 255, 0.35)');
     if (enemy.burn) auras.push('rgba(255, 120, 30, 0.35)');
     if (enemy.slow) auras.push('rgba(127, 216, 255, 0.4)');
     for (const aura of auras) {
@@ -894,13 +1275,18 @@ function drawEnemy(enemy) {
         canvasContext.fill();
     }
 
+    if (enemy.sprite) drawOrbiters(enemy, false);
     if (imgReady(image)) {
         // Сохраняем пропорции картинки
-        const ratio = image.naturalHeight / image.naturalWidth;
-        const w = size, h = size * ratio;
+        const dim = imgSize(image);
+        const w = size, h = size * dim.h / dim.w;
         canvasContext.filter = enemyFilter(enemy);
         canvasContext.drawImage(image, enemy.x - w / 2, enemy.y - h / 2, w, h);
         canvasContext.filter = 'none';
+        if (enemy.sprite) {
+            drawPupils(enemy, pulse);
+            drawOrbiters(enemy, true);
+        }
     } else {
         canvasContext.fillStyle = enemy.kind === 'green' ? 'green' : 'red';
         canvasContext.beginPath();
@@ -923,11 +1309,11 @@ function drawCorpses() {
     for (const c of gameState.corpses) {
         if (!imgReady(c.image)) continue;
         const k = c.life / c.maxLife;
-        const ratio = c.image.naturalHeight / c.image.naturalWidth;
-        const w = c.size * (0.4 + 0.6 * k), h = w * ratio;
+        const dim = imgSize(c.image);
+        const w = c.size * (0.4 + 0.6 * k), h = w * dim.h / dim.w;
         canvasContext.save();
         canvasContext.globalAlpha = k;
-        canvasContext.filter = c.filter + ' brightness(' + (1 + (1 - k) * 2) + ')';
+        canvasContext.filter = 'brightness(' + (1 + (1 - k) * 2) + ')';
         canvasContext.translate(c.x, c.y);
         canvasContext.rotate((1 - k) * c.spin);
         canvasContext.drawImage(c.image, -w / 2, -h / 2, w, h);
@@ -954,6 +1340,7 @@ function dropGems(x, y, total, count) {
 function collectGem(gem) {
     const g = gameState;
     g.xp += gem.value;
+    if (g.endless) g.xpEndless += gem.value;
     g.levelXp += gem.value;
     while (g.levelXp >= xpForLevel(g.level)) {
         g.levelXp -= xpForLevel(g.level);
@@ -1271,6 +1658,7 @@ function tryDash() {
 function damagePlayer(amount) {
     const player = gameState.player;
     if (player.invulnerableTime > 0 || player.dashTime > 0 || screen !== 'playing') return false;
+    if (debug.on && debug.god) return false;
     player.health = Math.max(0, player.health - amount);
     player.invulnerableTime = 1; // 1 секунда неуязвимости
     player.anim.hitFlash = 0.2;
@@ -1367,6 +1755,64 @@ function getHeroHitImg() {
     return c;
 }
 
+// Спрайт лучника разрезан на корпус и две ноги, чтобы ноги при беге двигались отдельно.
+// Все числа — в пикселях исходной картинки (703x1024).
+const HERO_CUT = {
+    belt: 540,                        // высота пояса
+    splitTop: 300, splitBottom: 217,  // линия между левой ногой и плащом: от (300, пояс) до (217, низ)
+    hipLeft: { x: 285, y: 545 },      // вокруг этих точек качаются ноги
+    hipRight: { x: 400, y: 545 },
+    waist: { x: 330, y: 540 }         // вокруг этой точки покачивается корпус
+};
+
+function cutHeroPart(source, polygon) {
+    const c = document.createElement('canvas');
+    c.width = source.width || source.naturalWidth;
+    c.height = source.height || source.naturalHeight;
+    const g = c.getContext('2d');
+    g.beginPath();
+    polygon.forEach((pt, i) => (i ? g.lineTo(pt[0], pt[1]) : g.moveTo(pt[0], pt[1])));
+    g.closePath();
+    g.clip();
+    g.drawImage(source, 0, 0);
+    return c;
+}
+
+function cutHero(source) {
+    const w = source.width || source.naturalWidth, h = source.height || source.naturalHeight;
+    const cut = HERO_CUT, overlap = 14; // части немного заходят друг на друга, чтобы не было щелей
+    return {
+        upper: cutHeroPart(source, [[0, 0], [w, 0], [w, cut.belt + overlap], [0, cut.belt + overlap]]),
+        legLeft: cutHeroPart(source, [[0, cut.belt - overlap], [cut.splitTop, cut.belt - overlap], [cut.splitBottom, h], [0, h]]),
+        legRight: cutHeroPart(source, [[cut.splitTop, cut.belt - overlap], [w, cut.belt - overlap], [w, h], [cut.splitBottom, h]])
+    };
+}
+
+let heroParts = null; // { normal: {...}, hit: {...} }
+function getHeroParts() {
+    if (heroParts || !imgReady(heroimg)) return heroParts;
+    heroParts = { normal: cutHero(heroimg), hit: cutHero(getHeroHitImg()) };
+    return heroParts;
+}
+
+// Рисует лучника по частям. Начало координат — у ног, по центру; картинка занимает (-w/2, -h)...(w/2, 0).
+function drawHeroParts(parts, w, h, legAngle, torsoAngle) {
+    const kx = w / 703, ky = h / 1024;
+    const drawPart = (image, pivot, angle) => {
+        const px = -w / 2 + pivot.x * kx, py = -h + pivot.y * ky;
+        canvasContext.save();
+        canvasContext.translate(px, py);
+        canvasContext.rotate(angle);
+        canvasContext.translate(-px, -py);
+        canvasContext.drawImage(image, -w / 2, -h, w, h);
+        canvasContext.restore();
+    };
+    // Ноги качаются в противоход, корпус слегка покачивается навстречу
+    drawPart(parts.legRight, HERO_CUT.hipRight, -legAngle * 0.7);
+    drawPart(parts.legLeft, HERO_CUT.hipLeft, legAngle);
+    drawPart(parts.upper, HERO_CUT.waist, torsoAngle);
+}
+
 const DEATH_DURATION = 1.3;
 
 // "Тени" лучника во время рывка
@@ -1419,6 +1865,7 @@ function drawPlayer() {
     }
 
     let offsetX = 0, offsetY = 0, rotation = a.tilt, scaleX = 1, scaleY = 1, alpha = 1;
+    let legAngle = 0, torsoAngle = 0;
 
     if (dying) {
         // Падает назад (от направления взгляда) и растворяется
@@ -1435,11 +1882,14 @@ function drawPlayer() {
             scaleY = 0.92;
             rotation = a.moveX * 0.2;
         } else if (moving) {
-            // Подпрыгивание при каждом шаге + лёгкое сжатие на приземлении
-            const step = Math.abs(Math.sin(a.walkPhase));
-            offsetY = -step * 9;
-            scaleY = 1 - (1 - step) * 0.05;
-            scaleX = 1 + (1 - step) * 0.03;
+            // Шаг: ноги качаются, корпус подпрыгивает и слегка сжимается на приземлении
+            const swing = Math.sin(a.walkPhase);
+            const step = Math.abs(swing);
+            legAngle = swing * 0.24;
+            torsoAngle = -swing * 0.035;
+            offsetY = -(1 - step) * 7;
+            scaleY = 1 - step * 0.03;
+            scaleX = 1 + step * 0.02;
         } else {
             // Дыхание в покое
             const b = Math.sin(a.breath);
@@ -1466,12 +1916,12 @@ function drawPlayer() {
     canvasContext.rotate(rotation);
     // Картинка смотрит влево: отражаем, если лучник смотрит вправо
     canvasContext.scale(scaleX * (a.facing === 1 ? -1 : 1), scaleY);
-    if (imgReady(heroimg)) {
-        canvasContext.drawImage(heroimg, -player.width / 2, -player.height, player.width, player.height);
-        const hitImg = getHeroHitImg();
-        if (hitImg && (a.hitFlash > 0 || dying)) {
+    const parts = getHeroParts();
+    if (parts) {
+        drawHeroParts(parts.normal, player.width, player.height, legAngle, torsoAngle);
+        if (a.hitFlash > 0 || dying) {
             canvasContext.globalAlpha = alpha * (dying ? Math.max(0, 0.7 - a.deathTime) : Math.min(1, a.hitFlash / 0.12) * 0.85);
-            canvasContext.drawImage(hitImg, -player.width / 2, -player.height, player.width, player.height);
+            drawHeroParts(parts.hit, player.width, player.height, legAngle, torsoAngle);
         }
     } else {
         canvasContext.fillStyle = 'blue';
@@ -1529,7 +1979,7 @@ function applyPickup(pickup) {
     } else if (pickup.type === 'damage') {
         player.damage += 10;
     } else if (pickup.type === 'fireRate') {
-        player.fireRate = Math.max(0.1, player.fireRate * 0.9);
+        player.fireRate = Math.max(BALANCE.minFireRate, player.fireRate * 0.9);
     }
     const t = PICKUP_TYPES[pickup.type];
     player.anim.auraTimer = 0.5;
@@ -1794,6 +2244,10 @@ function drawMenu(dt) {
         drawText(shopMessage, GAME.width / 2, 895, 38, 'center', '#ffd54a');
     }
     drawText(recordsText(), GAME.width / 2, 1010, 30, 'center');
+    if (debug.on) {
+        drawText('ОТЛАДКА: X — +1000 опыта · R — сбросить прогресс · в игре цифры 0–9 · F2 — выключить',
+            GAME.width / 2, 955, 26, 'center', '#ff4dff');
+    }
 }
 
 function drawPauseOverlay() {
@@ -1830,10 +2284,11 @@ function drawEndOverlay(isWin) {
     const g = gameState;
     dimScreen(0.6);
     drawText(isWin ? 'YOU WIN' : 'YOU LOSE', GAME.width / 2, 320, isWin ? 180 : 140, 'center', isWin ? '#ffd54a' : '#ffffff');
-    drawText('Время: ' + formatTime(g.time) + '   Убийств: ' + g.kills + '   Уровень: ' + g.level + '   +' + g.xp + ' опыта',
+    drawText('Время: ' + formatTime(g.time) + '   Убийств: ' + g.kills + '   Уровень: ' + g.level + '   +' + (g.debugUsed ? 0 : metaXP(g)) + ' опыта',
         GAME.width / 2, 420, 40, 'center');
     drawText('Всего опыта: ' + totalXP, GAME.width / 2, 475, 34, 'center');
-    if (g.newRecords.length) drawText('Новый рекорд: ' + g.newRecords.join(', ') + '!', GAME.width / 2, 540, 40, 'center', '#ffd54a');
+    if (g.debugUsed) drawText('Режим отладки: опыт и рекорды этого забега не сохранены', GAME.width / 2, 540, 34, 'center', '#ff4dff');
+    else if (g.newRecords.length) drawText('Новый рекорд: ' + g.newRecords.join(', ') + '!', GAME.width / 2, 540, 40, 'center', '#ffd54a');
     if (isWin) drawText('C — продолжить в бесконечном режиме', GAME.width / 2, 650, 46, 'center', '#ffd54a');
     drawText('Enter — новая игра', GAME.width / 2, 720, 44, 'center');
     drawText('M или Esc — в меню (потратить опыт)', GAME.width / 2, 775, 36, 'center');
@@ -1894,15 +2349,24 @@ function draw() {
     drawBullets();
     drawBolts();
     drawPopups();
+    if (debug.on && debug.hitboxes) drawDebugHitboxes();
     canvasContext.restore();
 
     drawHUD();
+    if (debug.on) drawDebugPanel();
 }
 
 let lastTime = performance.now();
 function play(now) {
     // Время кадра в секундах; ограничиваем, чтобы после сворачивания вкладки не было рывка
     const dt = Math.min((now - lastTime) / 1000, 0.05);
+    debug.frames++;
+    debug.fpsTimer += (now - lastTime) / 1000;
+    if (debug.fpsTimer >= 0.5) {
+        debug.fps = Math.round(debug.frames / debug.fpsTimer);
+        debug.frames = 0;
+        debug.fpsTimer = 0;
+    }
     lastTime = now;
 
     if (screen === 'playing') update(dt);
